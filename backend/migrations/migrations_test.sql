@@ -1,4 +1,4 @@
--- Run against a disposable PostgreSQL database after applying the up migration:
+-- Run against a disposable PostgreSQL database after applying all up migrations:
 -- psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -f migrations/migrations_test.sql
 
 BEGIN;
@@ -275,6 +275,40 @@ BEGIN
     END IF;
 
     RAISE NOTICE 'Migration schema and constraint tests passed';
+END;
+$$;
+
+-- Repeated timestamps exercise the ID ordering used for stable history pagination.
+INSERT INTO stock_movements (product_id, warehouse_id, movement_type, quantity_delta, reference_type, reference_id, reference_item_id, performed_by, occurred_at)
+SELECT '00000000-0000-0000-0000-000000000001'::UUID,
+    CASE WHEN n % 2 = 0 THEN '00000000-0000-0000-0000-000000000001'::UUID ELSE '00000000-0000-0000-0000-000000000002'::UUID END,
+    'GOODS_RECEIPT', 1.000, 'GOODS_RECEIPT', gen_random_uuid(), gen_random_uuid(),
+    '00000000-0000-0000-0000-000000000002'::UUID, CURRENT_TIMESTAMP - (n % 100) * INTERVAL '1 day'
+FROM generate_series(1, 40000) AS n;
+
+ANALYZE stock_movements;
+
+DO $$
+DECLARE
+    query_plan JSONB;
+BEGIN
+    EXECUTE $query$
+        EXPLAIN (FORMAT JSON)
+        SELECT id, quantity_delta, occurred_at FROM stock_movements
+        WHERE warehouse_id = '00000000-0000-0000-0000-000000000001'
+        AND product_id = '00000000-0000-0000-0000-000000000001'
+        ORDER BY occurred_at DESC, id DESC LIMIT 20
+    $query$ INTO query_plan;
+
+    IF jsonb_path_exists(query_plan, '$.**."Node Type" ? (@ == "Sort" || @ == "Incremental Sort")') THEN
+        RAISE EXCEPTION 'Stock history query requires an extra sort: %', query_plan;
+    END IF;
+
+    IF NOT jsonb_path_exists(query_plan, '$.**."Index Name" ? (@ == "stock_movements_warehouse_product_occurred_at_idx")') THEN
+        RAISE EXCEPTION 'Stock history query does not use its composite index: %', query_plan;
+    END IF;
+
+    RAISE NOTICE 'Stock history query plan test passed';
 END;
 $$;
 
