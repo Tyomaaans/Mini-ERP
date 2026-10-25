@@ -1,0 +1,1 @@
+DROP INDEX stock_movements_warehouse_product_occurred_at_idx;
